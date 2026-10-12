@@ -11,6 +11,7 @@
 
 #include "strata/core/pinned.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/platform/memlog.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
@@ -248,6 +249,8 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     if (!GlobalMemoryStatusEx(&status)) return false;
     m.available = (uint64_t) status.ullAvailPhys;
     m.commit = (uint64_t) status.ullAvailPageFile;
+    // STRATA_RAM_CAP_GIB: the same room as the main path's gates
+    m.available = strata::platform::memlog::room_for(m.available);
     return m.available > 0;
 #elif defined(__linux__)
     // MemAvailable includes reclaimable page cache, unlike _SC_AVPHYS_PAGES.
@@ -324,7 +327,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
             path = path.parent_path();
         }
     }
-    m.available = bytes;
+    m.available = strata::platform::memlog::room_for(bytes);
     return true;
 #else
     (void) meminfo; (void) self_cgroup; (void) cgroup_root;

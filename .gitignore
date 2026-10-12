@@ -51,7 +51,18 @@ build-vision-cuda12.bat
 /engine-cuda12/
 /build-release*/
 /dist/
+# the gfx1100 build of the RAM-ceiling branch (build-cap.bat): output, not source
+/dist-cap/
 *.done
+
+# a session's scratch: analysis notes and throwaway benches, not project source
+/tmp/
+
+# crash dumps of a stalled engine; the stall report keeps the summary that mattered
+*.dmp
+
+# written at run time by --expert-profile-save on the user's machine
+/data/expert-profile-gyro-m.bin
 /third_party/*.zip
 
 # IDEs

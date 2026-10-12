@@ -74,6 +74,7 @@ struct HostMemory {
     uint64_t available = 0;
     uint64_t cgroup_limit = ~uint64_t{0};
     uint64_t commit = ~uint64_t{0};   ///< available Windows commit capacity; ~0 when not reported
+    bool by_ceiling = false;          ///< `available` is STRATA_RAM_CAP_GIB's room, not the machine's reading
 };
 
 /// Linux reads `meminfo`, `self_cgroup` and the cgroup tree under `cgroup_root` (the parameters are for tests; the
@@ -580,9 +581,13 @@ public:
     const uint8_t* blob(int64_t layer, int64_t expert) override;
     /// With io prefetch in the experts.bin tier, the mapping itself (blob() may hand out a recycled staging buffer).
     const uint8_t* blob_stable(int64_t layer, int64_t expert) override;
-    /// Windows, opt-in with STRATA_FILE_RELEASE=1: trim the file mapping's full pages after their expert reaches
-    /// VRAM. Never touches the resident complement or staging buffers. Disabled by default.
+    /// Windows, opt-in with STRATA_FILE_RELEASE=1, or while the last request end found this process over the
+    /// STRATA_RAM_CAP_GIB ceiling: trim the file mapping's full pages after their expert reaches VRAM. Never touches
+    /// the resident complement or staging buffers. Off by default.
     uint64_t release(int64_t layer, int64_t expert) override;
+    /// Windows: the whole mapped view leaves this process's working set for the standby list (still cached, counted
+    /// as available); the next touch is a soft fault.  The bytes advised, 0 elsewhere or with the view closed.
+    uint64_t trim_mapping();
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     bool pcie_layer(int64_t layer) const override;

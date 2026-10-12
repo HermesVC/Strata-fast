@@ -7,6 +7,7 @@
 
 #include "strata/core/pinned.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/platform/memlog.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
@@ -261,6 +262,13 @@ bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current
 
 namespace detail {
 
+/// STRATA_RAM_CAP_GIB: the operator's ceiling for this process's RAM.  When it is set, a gate that asks what is left
+/// gets min(what the OS says is left, the ceiling minus the private working set this process already holds) - the
+/// ceiling decides, it is not an extra warning.  The commit capacity stays the machine's.  Unset or 0 changes nothing.
+void apply_ceiling(HostMemory& m) {
+    m.available = strata::platform::memlog::room_for(m.available, &m.by_ceiling);
+}
+
 bool host_available_memory(HostMemory& m, const std::string& meminfo, const std::string& self_cgroup,
                            const std::string& cgroup_root) {
     m = HostMemory{};
@@ -271,6 +279,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     if (!GlobalMemoryStatusEx(&status)) return false;
     m.available = (uint64_t) status.ullAvailPhys;
     m.commit = (uint64_t) status.ullAvailPageFile;
+    apply_ceiling(m);
     return m.available > 0;
 #elif defined(__linux__)
     // MemAvailable includes reclaimable page cache, unlike _SC_AVPHYS_PAGES.
@@ -348,6 +357,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
         }
     }
     m.available = bytes;
+    apply_ceiling(m);
     return true;
 #else
     (void) meminfo; (void) self_cgroup; (void) cgroup_root;
@@ -356,6 +366,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     if (pages <= 0 || page_bytes <= 0 ||
         (uint64_t) pages > std::numeric_limits<uint64_t>::max() / (uint64_t) page_bytes) return false;
     m.available = (uint64_t) pages * (uint64_t) page_bytes;
+    apply_ceiling(m);
     return m.available > 0;
 #endif
 }
@@ -364,12 +375,20 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
 
 namespace {
 
-bool available_memory_bytes(uint64_t& bytes, uint64_t* commit = nullptr) {
+bool available_memory_bytes(uint64_t& bytes, uint64_t* commit = nullptr, bool* by_ceiling = nullptr) {
     detail::HostMemory m;
     if (!detail::host_available_memory(m)) return false;
     bytes = m.available;
     if (commit != nullptr) *commit = m.commit;
+    if (by_ceiling != nullptr) *by_ceiling = m.by_ceiling;
     return bytes > 0;
+}
+
+/// The name of what limited a resident decision, for its message: the machine's commit, its RAM, or the RAM under the
+/// operator's ceiling.
+const char* resident_limit(uint64_t physical, uint64_t commit, bool by_ceiling) {
+    if (commit < physical) return "commit";
+    return by_ceiling ? "RAM under the STRATA_RAM_CAP_GIB ceiling" : "RAM";
 }
 
 /// #1250: the pages that are really free (MemFree), not the reclaimable cache MemAvailable counts; false when unknown.
@@ -387,7 +406,7 @@ bool free_memory_bytes(uint64_t& bytes) {
 #endif
 }
 
-void log_complement_memory(const char* stage, uint64_t requested) {
+void log_complement_memory(const char* stage, uint64_t requested, uint64_t headroom) {
 #if defined(_WIN32)
     MEMORYSTATUSEX status{};
     status.dwLength = sizeof(status);
@@ -403,7 +422,30 @@ void log_complement_memory(const char* stage, uint64_t requested) {
 #else
     (void) stage;
     (void) requested;
+    (void) headroom;
 #endif
+    if (strata::platform::memlog::on()) {
+        // The resident tier read three ways at the moment its size was decided: what the planner took, what the
+        // machine allowed it, and what a ceiling of its own would have allowed.  Reporting only - the decision is
+        // above, this compares it with a ceiling without changing it.
+        namespace ml = strata::platform::memlog;
+        const ml::Reading own = ml::read();
+        const uint64_t cap = ml::probe_cap();
+        const uint64_t machine_room = ml::sub_or_zero(own.avail, headroom);
+        // the deciding rule (memlog::ceiling_room), so this line and the decision cannot disagree
+        const uint64_t cap_room = ml::sub_or_zero(ml::ceiling_room({ own.avail, own.private_ws, 0, cap }).room, headroom);
+        std::fprintf(stderr, "memlog %s: requested=%llu private=%llu cap=%llu avail=%llu headroom=%llu | room machine=%llu "
+                             "under cap=%llu | %s\n",
+                     stage, (unsigned long long) (requested >> 20), (unsigned long long) (own.private_ws >> 20),
+                     (unsigned long long) (cap >> 20), (unsigned long long) (own.avail >> 20),
+                     (unsigned long long) (headroom >> 20), (unsigned long long) (machine_room >> 20),
+                     (unsigned long long) (cap_room >> 20),
+                     cap == 0 ? "no ceiling" : (strata::platform::memlog::deciding()
+                         ? (requested <= cap_room ? "the deciding ceiling allows the whole tier"
+                                                   : "the deciding ceiling clamps the tier")
+                         : (requested <= cap_room ? "the ceiling allows the whole tier"
+                                                   : "the ceiling would clamp the tier")));
+    }
 }
 
 /// #286: an unbuffered file handle - a HANDLE on Windows, an O_DIRECT descriptor (as a pointer-sized integer) on Linux.
@@ -445,6 +487,15 @@ bool file_tier_unbuffered(const std::vector<std::string>& paths, uint64_t arena_
                   (double) avail / (1ull << 30), (double) arena_bytes / (1ull << 30), (double) read_bytes / (1ull << 30),
                   keepable ? "can" : "cannot");
     why = msg;
+    if (strata::platform::memlog::on()) {
+        // The same inputs read three ways: the gate's own answer, what it would answer if the bytes it charges as
+        // `arena` were not counted twice (on Linux MemAvailable already has this process's share taken off), and what
+        // it would answer under an operator ceiling.  Reporting only, the decision above is already made.
+        const strata::platform::memlog::Reading own = strata::platform::memlog::read();
+        strata::platform::memlog::gate("file_cache_gate", strata::platform::memlog::gate_probe(
+            avail, own.ws, strata::platform::memlog::probe_cap(), arena_bytes, read_bytes, 1ull << 30, 0.05, 3ull << 29),
+            why.c_str());
+    }
     return !keepable;
 #else
     (void) paths; (void) arena_bytes; (void) read_bytes;
@@ -1989,7 +2040,7 @@ uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
         const char* v = std::getenv("STRATA_FILE_RELEASE");
         return v != nullptr && std::strcmp(v, "1") == 0;
     }();
-    if (!enabled || base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
+    if (!(enabled || strata::platform::memlog::over()) || base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
         return 0;
     static const uint64_t page = [] {
         SYSTEM_INFO info{};
@@ -2017,6 +2068,7 @@ uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
                 return 0;
             }
         }
+        strata::platform::memlog::add_trimmed(whole);
         return whole;   // bytes advised, not a measurement of physical RAM reclaimed
     };
     if (role_ptr_.empty()) {
@@ -2031,6 +2083,25 @@ uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
     return bytes;
 #else
     (void) layer; (void) expert;
+    return 0;
+#endif
+}
+
+uint64_t FileExpertSource::trim_mapping() {
+#if defined(_WIN32)
+    // VirtualUnlock on pages that are not locked moves them to the standby list (and reports ERROR_NOT_LOCKED).
+    // Not with the view closed (the startup unbuffered path): its range may hold other memory by now.
+    uint64_t bytes = 0;
+    if (maps_.empty() && base_ != nullptr) {
+        (void) VirtualUnlock((LPVOID) base_, (SIZE_T) mapped_bytes_);
+        bytes = mapped_bytes_;
+    }
+    for (const Map& m : maps_) {
+        (void) VirtualUnlock((LPVOID) m.base, (SIZE_T) m.bytes);
+        bytes += m.bytes;
+    }
+    return bytes;
+#else
     return 0;
 #endif
 }
@@ -2093,18 +2164,38 @@ bool FileExpertSource::pin_cache_complement(
     const bool what_fits = budget_bytes == kResidentWhatFits;   // #467: the soft mode's second try
     uint64_t budget_physical = 0;   // #403: reuse the memory snapshot a budget was sized from
     uint64_t budget_commit = std::numeric_limits<uint64_t>::max();
+    bool budget_by_ceiling = false;
     if (budget_bytes > 0) {
         // CS-T: a RAM budget.  The complement's experts in `rank` order (the expert profile, hottest first) while
         // they fit, the rest left on the mapped files; Windows commit capacity also limits the allocation (#730).
         uint64_t physical = 0;
-        if (!available_memory_bytes(physical, &budget_commit)) {
+        if (!available_memory_bytes(physical, &budget_commit, &budget_by_ceiling)) {
             err = "FileExpertSource: cannot determine available memory for --resident-budget-gib";
             return false;
         }
         budget_physical = physical;
         const uint64_t available = std::min(physical, budget_commit);
-        const char* limit = budget_commit < physical ? "commit" : "RAM";
+        const char* limit = resident_limit(physical, budget_commit, budget_by_ceiling);
         const uint64_t clamped = detail::clamp_resident_budget(budget_bytes, physical, budget_commit, headroom_bytes);
+        if (strata::platform::memlog::on()) {
+            // What the clamp read, and what the ceiling's rule gives from this reading.  Reporting only: `clamped`
+            // above is the decision.
+            namespace ml = strata::platform::memlog;
+            const ml::Reading own = ml::read();
+            const uint64_t cap = ml::probe_cap();
+            const uint64_t room_cap = ml::sub_or_zero(ml::ceiling_room({ own.avail, own.private_ws, 0, cap }).room,
+                                                      headroom_bytes);
+            char requested[32];
+            if (what_fits) std::snprintf(requested, sizeof requested, "what-fits");
+            else std::snprintf(requested, sizeof requested, "%llu", (unsigned long long) (budget_bytes >> 20));
+            std::fprintf(stderr, "memlog resident_budget: requested=%s private=%llu cap=%llu physical=%llu commit=%llu "
+                                 "headroom=%llu room=%llu (%s) | room under cap=%llu | %s\n",
+                         requested, (unsigned long long) (own.private_ws >> 20),
+                         (unsigned long long) (cap >> 20), (unsigned long long) (physical >> 20),
+                         (unsigned long long) (budget_commit >> 20), (unsigned long long) (headroom_bytes >> 20),
+                         (unsigned long long) (available >> 20), limit, (unsigned long long) (room_cap >> 20),
+                         budget_bytes > clamped ? "clamped" : "not clamped");
+        }
         if (budget_bytes > clamped) {
             // #403: 256 MiB under the room, so the engine's own allocations after this reading still leave the
             // headroom (a budget clamped to exactly the room failed the safety check below on a reading a few MB
@@ -2154,7 +2245,8 @@ bool FileExpertSource::pin_cache_complement(
         // allocations, the file cache) failed a budget the first one had clamped.  (A budget turns `lend` off.)
         uint64_t physical = budget_physical;
         uint64_t commit = budget_commit;
-        if (physical == 0 && !available_memory_bytes(physical, &commit)) {
+        bool by_ceiling = budget_by_ceiling;
+        if (physical == 0 && !available_memory_bytes(physical, &commit, &by_ceiling)) {
             err = "FileExpertSource: cannot determine available memory for the resident-memory safety check";
             return false;
         }
@@ -2165,7 +2257,7 @@ bool FileExpertSource::pin_cache_complement(
             std::snprintf(message, sizeof message,
                           "FileExpertSource: resident complement %.2f GiB exceeds available %s (%.2f GiB) minus the "
                           "%.0f GiB safety headroom",
-                          (double) bytes / 1073741824.0, commit < physical ? "commit" : "RAM",
+                          (double) bytes / 1073741824.0, resident_limit(physical, commit, by_ceiling),
                           (double) available / 1073741824.0, (double) headroom_bytes / 1073741824.0);
             err = message;
             return false;
@@ -2221,7 +2313,7 @@ bool FileExpertSource::pin_cache_complement(
     if (bytes > 0) {
         std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB %s cache complement\n",
                      (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
-        log_complement_memory("before complement allocation", bytes);
+        log_complement_memory("before complement allocation", bytes, headroom_bytes);
         std::fflush(stderr);
         // #1250: the driver takes page-locked pages in one go and cannot wait for the kernel to reclaim file cache: with
         // the cache of the model files the engine read itself in the way (MemFree low, MemAvailable high) a host was
@@ -2287,7 +2379,7 @@ bool FileExpertSource::pin_cache_complement(
         if (arena == nullptr) {
             if (!note.empty()) {
                 std::fprintf(stderr, "FileExpertSource: %s; trying pageable memory\n", note.c_str());
-                log_complement_memory("before pageable allocation", bytes);
+                log_complement_memory("before pageable allocation", bytes, headroom_bytes);
                 std::fflush(stderr);
             }
             errno = 0;
@@ -2305,7 +2397,7 @@ bool FileExpertSource::pin_cache_complement(
                 err = "FileExpertSource: pageable resident complement allocation failed (malloc errno " +
                       std::to_string(allocation_errno) + ": " + std::strerror(allocation_errno) + ")";
                 if (!note.empty()) err += "; " + note;
-                log_complement_memory("after pageable allocation failure", bytes);
+                log_complement_memory("after pageable allocation failure", bytes, headroom_bytes);
                 return false;
             }
             if (pin) {
@@ -2537,12 +2629,8 @@ bool FileExpertSource::pin_cache_complement(
         release();
         return false;
     }
-#if defined(_WIN32)
-    // The mapped pages this process touched (the GPU cache's fill and this copy) leave its working set for the
-    // standby list: VirtualUnlock on pages that are not locked does exactly that (it then reports ERROR_NOT_LOCKED).
-    if (maps_.empty()) (void) VirtualUnlock((LPVOID) base_, (SIZE_T) mapped_bytes_);
-    for (const Map& m : maps_) (void) VirtualUnlock((LPVOID) m.base, (SIZE_T) m.bytes);
-#endif
+    // The mapped pages this process touched (the GPU cache's fill and this copy) leave its working set (Windows).
+    (void) trim_mapping();
 
     complement_arena_ = arena;
     complement_host_ = host;

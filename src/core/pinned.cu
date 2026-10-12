@@ -1,6 +1,7 @@
 // src/core/pinned.cu - P2.S1: the pinned host arena and the parallel expert load.
 #include "strata/core/pinned.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/platform/memlog.hpp"
 
 #include <cuda_runtime.h>
 
@@ -639,7 +640,8 @@ bool experts_unbuffered(const std::vector<std::string>& files, uint64_t arena_by
     MEMORYSTATUSEX ms{};
     ms.dwLength = sizeof ms;
     GlobalMemoryStatusEx(&ms);
-    const uint64_t avail = ms.ullAvailPhys;
+    // STRATA_RAM_CAP_GIB: the same room as every other memory gate; without it the reading is unchanged
+    const uint64_t avail = strata::platform::memlog::room_for(ms.ullAvailPhys);
     // what the cache could keep beside the arena (~4 GiB for everything else)
     const uint64_t need = read_bytes == kAllFileBytes ? total_bytes : read_bytes;
     const bool keepable = strata::platform::file_cache_keeps(avail, arena_bytes, need);
@@ -653,6 +655,15 @@ bool experts_unbuffered(const std::vector<std::string>& files, uint64_t arena_by
                       (double) avail / (1ull << 30), (double) arena_bytes / (1ull << 30), (double) need / (1ull << 30),
                       keepable ? "can" : "cannot");
     why = msg;
+    if (strata::platform::memlog::on()) {
+        // The same inputs read three ways.  On Windows the file pages this process touched are counted in its working
+        // set, so `avail` already has them taken off and the gate charges the arena again on top of that - which is
+        // what this comparison is for.  Reporting only, the decision above is already made.
+        const strata::platform::memlog::Reading own = strata::platform::memlog::read();
+        strata::platform::memlog::gate("file_cache_gate", strata::platform::memlog::gate_probe(
+            avail, own.ws, strata::platform::memlog::probe_cap(), arena_bytes, need, 4ull << 30, 1.0, 0ull),
+            why.c_str());
+    }
     return (!cached || !cache_counts) && !keepable;
 #else
     (void) files; (void) arena_bytes; (void) cache_counts; (void) read_bytes;

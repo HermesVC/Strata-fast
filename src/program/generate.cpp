@@ -15,6 +15,7 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
 #include "strata/platform/memory.hpp"
+#include "strata/platform/memlog.hpp"
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/device.hpp"
@@ -8924,6 +8925,10 @@ int main(int argc, char** argv) {
             }
             cur = ids;
             const Clock::time_point r0 = Clock::now();
+            // STRATA_MEMLOG: what this process holds at the request boundary, so a growth can be attributed to a phase
+            // instead of to the session as a whole.  Reporting only; off, nothing is read and nothing is printed.
+            const strata::platform::memlog::Reading req0 = strata::platform::memlog::on()
+                ? strata::platform::memlog::read() : strata::platform::memlog::Reading{};
             // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
             // exactly the start of this prompt - at most n - 1 of them, the last token is always the first window
             auto starts_with = [&](const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) -> bool {
@@ -9762,6 +9767,10 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "
                                      "them\n", (long long) il_parts + 1, il_ms);
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
+            const strata::platform::memlog::Reading prompt_end = strata::platform::memlog::on()
+                ? strata::platform::memlog::read() : req0;
+            strata::platform::memlog::phase("prompt", req0, prompt_end, prompt_ms,
+                                            prompt_ms > 0 ? 1000.0 * (double) (n - resume) / prompt_ms : -1.0);
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
             std::fflush(stdout);
             // the verify windows: the first holds the last prompt token alone
@@ -10584,6 +10593,18 @@ int main(int argc, char** argv) {
                 p += a + 1;
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
+            if (strata::platform::memlog::on())
+                strata::platform::memlog::phase("decode", prompt_end, strata::platform::memlog::read(), decode_ms,
+                                                decode_ms > 0 ? 1000.0 * (double) produced_n / decode_ms : -1.0);
+            // STRATA_RAM_CAP_GIB, the runtime half: over the ceiling at a request end, the mapped expert pages leave
+            // the working set (the gates can only refuse new allocations; the mapping grows by page faults, which no
+            // gate sees).  Without the ceiling nothing is read.
+            if (strata::platform::memlog::mark_over() && srcp == &src) {
+                const Clock::time_point t_trim = Clock::now();
+                const uint64_t advised = src.trim_mapping();
+                strata::platform::memlog::after_trim(
+                    advised, std::chrono::duration<double, std::milli>(Clock::now() - t_trim).count());
+            }
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
             if (!ver.wait_commit(err)) {
                 std::printf("ERR %s\n", err.c_str());
